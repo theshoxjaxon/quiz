@@ -19,9 +19,10 @@ export async function POST(req: Request) {
 
   const body = await req.json().catch(() => null);
   const raw = body?.answers && typeof body.answers === "object" ? body.answers : {};
-  const { answers, score } = grade(db.select().from(questions).all(), raw); // answers: questionId -> option ID
+  const { answers, score } = grade(await db.select().from(questions), raw); // answers: questionId -> option ID
 
-  const { changes } = db
+  // The unique student_id makes this insert succeed exactly once, whichever instance handles it.
+  const { rowsAffected } = await db
     .insert(submissions)
     .values({
       studentId: student.id,
@@ -32,7 +33,7 @@ export async function POST(req: Request) {
     })
     .onConflictDoNothing()
     .run();
-  if (!changes) return NextResponse.json({ error: uz.errors.alreadySubmitted }, { status: 409 });
+  if (!rowsAffected) return NextResponse.json({ error: uz.errors.alreadySubmitted }, { status: 409 });
 
   return NextResponse.json({ ok: true });
 }

@@ -6,7 +6,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import Database from "better-sqlite3";
+import { createClient, type Client } from "@libsql/client";
 import { uz } from "../lib/i18n/uz.ts";
 import { QUIZ_MS, SUBMIT_GRACE_MS } from "../lib/quiz.ts";
 
@@ -14,11 +14,13 @@ const ROOT = join(import.meta.dirname, "..");
 const dir = mkdtempSync(join(tmpdir(), "quiz-api-"));
 const PORT = 4100 + Math.floor(Math.random() * 800);
 const BASE = `http://localhost:${PORT}`;
-const env = { ...process.env, DB_FILE: join(dir, "test.db"), ADMIN_PASSWORD: "test-pw" };
+const DB_URL = `file:${join(dir, "test.db")}`;
+// Explicit values win over .env.local for both Node and Next, so the tests can never reach a real Turso database.
+const env = { ...process.env, TURSO_DATABASE_URL: DB_URL, TURSO_AUTH_TOKEN: "", ADMIN_PASSWORD: "test-pw" };
 const ADMIN = { authorization: "Basic " + Buffer.from("teacher:test-pw").toString("base64") };
 const JSON_HEADERS = { "content-type": "application/json" };
 let server: ChildProcess | undefined;
-let db: Database.Database;
+let db: Client;
 
 const newestSource = (path: string): number =>
   statSync(path).isDirectory()
@@ -30,8 +32,7 @@ before(async () => {
   if (Math.max(...["app", "lib", "db", "proxy.ts"].map((p) => newestSource(join(ROOT, p)))) > built) {
     throw new Error("The production build is missing or older than the source. Run `npm run build` first.");
   }
-  execFileSync(join(ROOT, "node_modules/.bin/drizzle-kit"), ["push"], { cwd: ROOT, env, stdio: "ignore" });
-  execFileSync(process.execPath, ["db/seed.ts"], { cwd: ROOT, env, stdio: "ignore" });
+  execFileSync(process.execPath, ["db/setup.ts"], { cwd: ROOT, env, stdio: "ignore" }); // migrations + questions
   server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(PORT)], {
     cwd: ROOT,
     env,
@@ -41,7 +42,7 @@ before(async () => {
   for (let i = 0; i < 150 && !(await fetch(`${BASE}/api/quiz`).then(() => true, () => false)); i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
-  db = new Database(env.DB_FILE);
+  db = createClient({ url: DB_URL, timeout: 5000 });
 });
 
 after(() => {
@@ -50,9 +51,10 @@ after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+const rows = async <T>(sql: string) => (await db.execute(sql)).rows as unknown as T[];
+const count = async (sql: string) => Number((await rows<{ n: number }>(sql))[0].n);
 const backdate = (studentId: string, ms: number) =>
-  db.prepare("update students set started_at = ? where student_id = ?").run(Date.now() - ms, studentId);
+  db.execute({ sql: "update students set started_at = ? where student_id = ?", args: [Date.now() - ms, studentId] });
 const admin = (method: string, path: string) => fetch(BASE + path, { method, headers: ADMIN });
 const submit = (cookie: string, body: object) =>
   fetch(`${BASE}/api/submit`, { method: "POST", headers: { ...JSON_HEADERS, cookie }, body: JSON.stringify(body) });
@@ -82,7 +84,7 @@ test("registration: one per name and per ID, resume needs both, rejected after s
   const otherName = await register("Someone Else", "ada1");
   assert.equal(otherName.status, 409);
   assert.equal(otherName.error, uz.errors.idTakenOtherName);
-  assert.equal(count("select count(*) n from students where name_key = 'ada lovelace' or student_id like 'ada%'"), 1);
+  assert.equal(await count("select count(*) n from students where name_key = 'ada lovelace' or student_id like 'ada%'"), 1);
 
   assert.equal((await submit(first.cookie, { answers: {} })).status, 200);
   const sameAgain = await register("Ada Lovelace", "ada1");
@@ -93,46 +95,43 @@ test("registration: one per name and per ID, resume needs both, rejected after s
   assert.equal(newIdAgain.error, uz.errors.nameTakenSubmitted);
 
   // The database itself refuses a second row with the same normalized name.
-  assert.throws(
-    () =>
-      db
-        .prepare("insert into students (name, name_key, student_id, token, started_at) values ('x', 'ada lovelace', 'x9', 'tok-x9', 0)")
-        .run(),
+  await assert.rejects(
+    db.execute("insert into students (name, name_key, student_id, token, started_at) values ('x', 'ada lovelace', 'x9', 'tok-x9', 0)"),
     /UNIQUE/,
   );
 });
 
 test("late cap: accepted up to 2 minutes past the deadline, rejected after", async () => {
   const late = await register("Late Larry", "late1");
-  backdate("late1", QUIZ_MS + 60_000);
+  await backdate("late1", QUIZ_MS + 60_000);
   assert.equal((await submit(late.cookie, { answers: {} })).status, 200);
-  const taken = count(
+  const taken = await count(
     "select time_taken_sec n from submissions s join students st on st.id = s.student_id where st.student_id = 'late1'",
   );
   assert.ok(taken > QUIZ_MS / 1000, "recorded as late");
 
   const tooLate = await register("Too Late Tina", "late2");
-  backdate("late2", QUIZ_MS + SUBMIT_GRACE_MS + 5_000);
+  await backdate("late2", QUIZ_MS + SUBMIT_GRACE_MS + 5_000);
   // Client-sent times are ignored: only the stored start time counts.
   const res = await submit(tooLate.cookie, { answers: {}, startedAt: Date.now(), submittedAt: Date.now() });
   assert.equal(res.status, 403);
   assert.equal(
-    count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id = 'late2'"),
+    await count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id = 'late2'"),
     0,
   );
 });
 
 test("team lock: the API refuses to regenerate while locked", async () => {
   for (let i = 0; i < 8; i++) await register(`Team Tester ${i}`, `tt${i}`);
-  const assignments = () => JSON.stringify(db.prepare("select id, team_id from students order by id").all());
+  const assignments = async () => JSON.stringify(await rows("select id, team_id from students order by id"));
 
   assert.equal((await fetch(`${BASE}/api/admin/teams/lock`, { method: "PUT" })).status, 401, "needs the password");
   assert.equal((await admin("POST", "/api/admin/teams")).status, 200);
-  const lockedTeams = assignments();
+  const lockedTeams = await assignments();
 
   assert.equal((await admin("PUT", "/api/admin/teams/lock")).status, 200);
   assert.equal((await admin("POST", "/api/admin/teams")).status, 409);
-  assert.equal(assignments(), lockedTeams, "assignments unchanged while locked");
+  assert.equal(await assignments(), lockedTeams, "assignments unchanged while locked");
 
   assert.equal((await admin("DELETE", "/api/admin/teams/lock")).status, 200);
   assert.equal((await admin("POST", "/api/admin/teams")).status, 200);
@@ -140,12 +139,9 @@ test("team lock: the API refuses to regenerate while locked", async () => {
 
 test("options: shuffled per student, stable on refresh, graded by option ID", async () => {
   type Quiz = { questions: { id: number; options: { id: number; text: string }[] }[] };
-  const key = db.prepare("select id, options, correct_index, points from questions").all() as {
-    id: number;
-    options: string;
-    correct_index: number;
-    points: number;
-  }[];
+  const key = await rows<{ id: number; options: string; correct_index: number; points: number }>(
+    "select id, options, correct_index, points from questions",
+  );
   const { cookie } = await register("Shuffle Sam", "shuffle1");
   const load = () => fetch(`${BASE}/api/quiz`, { headers: { cookie } }).then((r) => r.text());
 
@@ -166,7 +162,7 @@ test("options: shuffled per student, stable on refresh, graded by option ID", as
   const answers = Object.fromEntries(key.map((k) => [k.id, k.correct_index]));
   assert.equal((await submit(cookie, { answers })).status, 200);
   assert.equal(
-    count("select score n from submissions s join students st on st.id = s.student_id where st.student_id = 'shuffle1'"),
+    await count("select score n from submissions s join students st on st.id = s.student_id where st.student_id = 'shuffle1'"),
     key.reduce((sum, k) => sum + k.points, 0),
   );
 
@@ -180,20 +176,20 @@ test("options: shuffled per student, stable on refresh, graded by option ID", as
 });
 
 test("30 submissions in the same instant all succeed (WAL + busy timeout)", async () => {
-  assert.equal(db.pragma("journal_mode", { simple: true }), "wal");
+  assert.equal((await rows<{ journal_mode: string }>("PRAGMA journal_mode"))[0].journal_mode, "wal");
   const cookies: string[] = [];
   for (let i = 0; i < 30; i++) cookies.push((await register(`Burst Student ${i}`, `burst${i}`)).cookie);
   const statuses = await Promise.all(cookies.map((c) => submit(c, { answers: { 1: 2 } }).then((r) => r.status)));
   assert.deepEqual(statuses, Array(30).fill(200));
   assert.equal(
-    count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id like 'burst%'"),
+    await count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id like 'burst%'"),
     30,
   );
 });
 
 test("per-category scores: graded from the answers, shown in the JSON and CSV exports", async () => {
   type Key = { id: number; category: "logic" | "critical" | "teamwork"; correct_index: number; points: number };
-  const key = db.prepare("select id, category, correct_index, points from questions").all() as Key[];
+  const key = await rows<Key>("select id, category, correct_index, points from questions");
   const teamworkRight = key.filter((k) => k.category === "teamwork").slice(0, 2).map((k) => k.id);
   const isRight = (k: Key) => k.category === "logic" || teamworkRight.includes(k.id); // every critical answer wrong
   const answers = Object.fromEntries(key.map((k) => [k.id, isRight(k) ? k.correct_index : (k.correct_index + 1) % 4]));

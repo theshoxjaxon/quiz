@@ -9,13 +9,12 @@ const LATE_AFTER_SEC = (QUIZ_MS + LATE_FLAG_MS) / 1000;
 const CATEGORY_LABELS = { logic: "Logic", critical: "Critical", teamwork: "Teamwork" };
 const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 
-export default function Admin() {
-  const { questions, maxByCategory, students, teams } = getResults();
+export default async function Admin() {
+  const [{ questions, maxByCategory, students, teams }, lockedAt] = await Promise.all([getResults(), teamsLockedAt()]);
   const maxScore = questions.reduce((sum, q) => sum + q.points, 0);
   const submitted = students.filter((s) => s.score !== null);
   const avg = submitted.length ? Math.round(submitted.reduce((sum, s) => sum + s.score!, 0) / submitted.length) : 0;
   const hasTeams = students.some((s) => s.teamId !== null);
-  const lockedAt = teamsLockedAt();
 
   const stats = [
     ["Registered", students.length],

@@ -15,8 +15,8 @@ const csvCell = (v: unknown) => {
 // GET /api/admin/results               -> JSON
 // GET /api/admin/results?format=json   -> JSON download
 // GET /api/admin/results?format=csv    -> CSV download
-export function GET(req: Request) {
-  const { questions, maxByCategory, students, teams } = getResults();
+export async function GET(req: Request) {
+  const { questions, maxByCategory, students, teams } = await getResults();
   const format = new URL(req.url).searchParams.get("format");
   const teamName = (id: number | null) => teams.find((t) => t.id === id)?.name ?? "";
 

@@ -8,10 +8,10 @@ import RegisterForm from "./register-form";
 
 export const dynamic = "force-dynamic"; // the question count comes from the database
 
-export default function Home() {
+export default async function Home() {
   const t = uz.register;
   const minutes = QUIZ_MS / 60_000;
-  const questionCount = db.select({ n: count() }).from(questions).get()?.n ?? 0;
+  const questionCount = (await db.select({ n: count() }).from(questions).get())?.n ?? 0;
   const facts = [
     [ListChecks, t.questionCount(questionCount)],
     [Clock, t.minutes(minutes)],

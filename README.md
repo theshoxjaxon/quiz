@@ -2,7 +2,7 @@
 
 A 12-question, 25-minute test of logical thinking, critical thinking and teamwork judgment (4 questions and 40 points each). Students take it at `/` in Uzbek (Latin), and the teacher reviews results and generates teams at `/admin` (in English).
 
-Built with Next.js 16 (App Router), Tailwind, Drizzle ORM and SQLite (`quiz.db`).
+Built with Next.js 16 (App Router), Tailwind and Drizzle ORM on libSQL: a local SQLite file (`quiz.db`) on your computer, or a Turso database when deployed to Vercel.
 
 ## Run it
 
@@ -13,11 +13,11 @@ git clone https://github.com/theshoxjaxon/quiz.git
 cd quiz
 npm install
 cp .env.example .env.local    # then open .env.local and set your own ADMIN_PASSWORD
-npm run setup                 # creates quiz.db and loads the 12 questions
+npm run setup                 # creates quiz.db (tables from drizzle/) and loads the 12 questions
 npm run build && npm start    # serves on port 3000
 ```
 
-`npm start` also runs `npm run setup` on its own each time, so the database is always up to date before the server starts.
+`npm start` (and `npm run dev`) also run `npm run setup` on their own, so the database is always up to date before the server starts. Setup prints which database it uses: `file:quiz.db (local file)` unless Turso variables are set.
 
 - **Students** open `http://<this-computer's-IP>:3000`.
 - **Teacher** opens `/admin`. The browser asks for a login: any username, plus the `ADMIN_PASSWORD` you set.
@@ -33,12 +33,50 @@ npm run build && npm start    # serves on port 3000
 
 > Never delete `quiz.db` while the server is running. The server keeps writing to the deleted file, and every submission is lost on restart. Use `npm run db:reset` instead.
 
+## Deploy to Vercel
+
+Vercel can't keep a local file between requests, so the deployed app uses [Turso](https://turso.tech) (hosted libSQL, SQLite-compatible). Install the Turso CLI first: `brew install tursodatabase/tap/turso`.
+
+1. **Create the database** (once):
+
+   ```bash
+   turso auth login
+   turso db create quiz
+   turso db show quiz --url       # prints libsql://quiz-<your-name>.turso.io  -> TURSO_DATABASE_URL
+   turso db tokens create quiz    # prints a long token                        -> TURSO_AUTH_TOKEN
+   ```
+
+2. **Create the tables and load the questions** from your computer, once now and again after changing questions or the schema:
+
+   ```bash
+   TURSO_DATABASE_URL="$(turso db show quiz --url)" TURSO_AUTH_TOKEN="$(turso db tokens create quiz)" npm run setup
+   ```
+
+   The first line it prints should be `Database: libsql://… (remote)`. Re-running is safe: it only adds tables the database doesn't have yet and reloads the questions, keeping students and submissions.
+
+3. **Set three environment variables in Vercel** (Project → Settings → Environment Variables):
+
+   | Name | Value |
+   | --- | --- |
+   | `ADMIN_PASSWORD` | the teacher's password for `/admin` |
+   | `TURSO_DATABASE_URL` | the `libsql://…` URL from step 1 |
+   | `TURSO_AUTH_TOKEN` | the token from step 1 |
+
+4. **Deploy:** import the GitHub repo in Vercel (the defaults are fine), or run `vercel --prod`. If a page says "TURSO_DATABASE_URL is not set", the variables are missing: add them and redeploy.
+
+- **Clearing test data on Turso** is deliberately harder than locally: `npm run db:reset -- --yes-wipe-remote`, with the same two variables as in step 2. Without the flag it refuses.
+- **Preview deployments** use the same database as production unless you limit the Turso variables to the Production environment in Vercel.
+- **Keep the Turso variables out of `.env.local`** unless you want `npm run dev`, `npm run setup` and `npm run db:reset` on your computer to use the live database too. Passing them inline for one command (step 2) is safer.
+- The **Before the session** checklist is for running on a laptop. On Vercel, only the test run with 2–3 devices applies.
+
 ## How it works
 
 | Piece | Where |
 | --- | --- |
-| Schema: `students`, `questions`, `submissions`, `teams`, `settings` | `db/schema.ts` |
-| Questions, answer key, categories, point weights (120 pts total) | `db/questions.ts` (loaded by `db/seed.ts`) |
+| Schema: `students`, `questions`, `submissions`, `teams`, `settings` | `db/schema.ts`, migrations in `drizzle/` |
+| Database connection: Turso if `TURSO_DATABASE_URL` is set, else `file:quiz.db` | `db/index.ts` |
+| `npm run setup` / `db:reset`: apply migrations, load questions and teams | `db/setup.ts` |
+| Questions, answer key, categories, point weights (120 pts total) | `db/questions.ts` |
 | Every student-facing string (Uzbek) | `lib/i18n/uz.ts` |
 | Time limit, name matching, option shuffle, grading (total + per category) | `lib/quiz.ts` |
 | `POST /api/register`: name + student ID, sets session cookie, starts the clock | `app/api/register` |
@@ -55,6 +93,7 @@ npm run build && npm start    # serves on port 3000
 - **Shuffled options:** every student sees the same questions in the same order, but each question's options are shuffled per student (the same order on every refresh). On the dashboard, A–D refer to the answer-key order in `db/questions.ts`, not what a student saw.
 - **Per-category scores** are recomputed from each student's saved answers, so they always add up to the total.
 - **Ranking:** by total score, then by faster time. Students who never submitted rank last but still get placed in a team.
+- **Several servers at once** (as on Vercel) are fine. One registration per name and ID, one submission per student, and "no regenerating while locked" are all enforced by the database (unique constraints; team generation runs as one transaction that re-checks the lock), not by a single server process.
 
 ## Tests
 
@@ -62,16 +101,17 @@ npm run build && npm start    # serves on port 3000
 npm run build && npm test
 ```
 
-Unit tests cover ranking, team splits, name matching, the shuffle and grading. Question tests check the question bank: 4 per category, 40 points each, the correct option never the longest, and a brute-force proof that every logic puzzle has exactly one answer. API tests start a real server on a temporary database and port (never `quiz.db`). They check duplicate registration, the late cap, the team lock, shuffle and grading, and 30 simultaneous submissions. They check per-category scores too, and refuse to run against an out-of-date build. Editing `db/questions.ts` therefore needs `npm run build` again before `npm test`.
+Unit tests cover ranking, team splits, name matching, the shuffle and grading. Question tests check the question bank: 4 per category, 40 points each, the correct option never the longest, and a brute-force proof that every logic puzzle has exactly one answer. API tests start a real server on a temporary local database and port: never `quiz.db`, and never Turso, even if `.env.local` has Turso variables. They check duplicate registration, the late cap, the team lock, shuffle and grading, and 30 simultaneous submissions. They check per-category scores too, and refuse to run against an out-of-date build. Setup tests check that `db:reset` won't wipe a remote database without the extra flag, and that a Vercel deploy without Turso variables fails with a clear message. Editing `db/questions.ts` therefore needs `npm run build` again before `npm test`.
 
 ## Editing the test
 
 - **Wording:** change `lib/i18n/uz.ts` (UI) or `db/questions.ts` (questions). Write oʻ/gʻ with ʻ and the tutuq belgisi with ʼ, as the existing text does.
 - **Time limit:** `QUIZ_MS` in `lib/quiz.ts`. The registration page reads it, and the question count comes from the database.
-- After editing questions, restart with `npm start` (it reloads them), then run `npm run build && npm test` to re-check the rules.
+- After editing questions, restart with `npm start` (it reloads them), then run `npm run build && npm test` to re-check the rules. For the deployed app, repeat step 2 of **Deploy to Vercel**.
+- **Schema changes:** edit `db/schema.ts`, run `npm run db:generate` to write a new migration file into `drizzle/`, commit it, then run `npm run setup` (locally, and with the Turso variables for the deployed database).
 
 ## Notes
 
-- SQLite is a single file, so run the app on one machine (a laptop or a small server). Serverless hosts like Vercel won't keep `quiz.db`.
+- Locally the database is the single file `quiz.db`, so run the app on one machine. Deployed, it's Turso (see **Deploy to Vercel**).
 - The browser's own “please fill in this field” bubbles follow the browser's language, not `uz.ts`.
-- Over plain `http://`, the admin password travels unencrypted. That's fine on the school network; use HTTPS if the app is reachable from the internet.
+- Over plain `http://` (a laptop on the school network) the admin password travels unencrypted, which is fine on a school network. Vercel always serves HTTPS.

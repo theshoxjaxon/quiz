@@ -10,13 +10,13 @@
     "prestart": "npm run setup",
     "start": "next start",
     "lint": "eslint",
-    "setup": "drizzle-kit push && node db/seed.ts",
-    "db:seed": "node db/seed.ts",
-    "db:reset": "node db/seed.ts --reset",
+    "setup": "node --env-file-if-exists=.env.local db/setup.ts",
+    "db:reset": "node --env-file-if-exists=.env.local db/setup.ts --reset",
+    "db:generate": "drizzle-kit generate",
     "test": "node --test 'lib/*.test.ts' 'tests/*.test.ts'"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
+    "@libsql/client": "^0.18.0",
     "drizzle-orm": "^0.45.3",
     "lucide-react": "^1.49.0",
     "next": "16.3.8",
@@ -25,7 +25,6 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

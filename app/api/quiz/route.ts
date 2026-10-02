@@ -12,11 +12,11 @@ export async function GET() {
   const student = await currentStudent();
   if (!student) return NextResponse.json({ error: uz.errors.notRegistered }, { status: 401 });
 
-  if (db.select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, student.id)).get()) {
+  if (await db.select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, student.id)).get()) {
     return NextResponse.json({ submitted: true });
   }
 
-  const qs = db
+  const qs = await db
     .select({
       id: questions.id,
       category: questions.category,
@@ -25,8 +25,7 @@ export async function GET() {
       options: questions.options,
     })
     .from(questions)
-    .orderBy(asc(questions.id))
-    .all();
+    .orderBy(asc(questions.id));
 
   return NextResponse.json({
     studentId: student.id,
