@@ -1,45 +1,48 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, jsonb, pgTable, text, timestamp } from "drizzle-orm/pg-core";
 import { CATEGORIES } from "../lib/quiz.ts";
 
-export const teams = sqliteTable("teams", {
+// Row-level security is enabled on every table with no policies: Supabase's public Data API (anon key)
+// can't read or write anything, while the app, connecting as the owning postgres role, is unaffected.
+
+export const teams = pgTable("teams", {
   id: integer("id").primaryKey(), // 1 = Varsity / Alpha, 2–6 = random
   name: text("name").notNull(),
-});
+}).enableRLS();
 
-export const students = sqliteTable("students", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const students = pgTable("students", {
+  id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
   name: text("name").notNull(),
   nameKey: text("name_key").notNull().unique(), // nameKey(name): trimmed, case-folded; one registration per name
   studentId: text("student_id").notNull().unique(), // school ID or email, lowercased
   token: text("token").notNull().unique(), // session cookie value
-  startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
   teamId: integer("team_id").references(() => teams.id),
-});
+}).enableRLS();
 
-export const questions = sqliteTable("questions", {
+export const questions = pgTable("questions", {
   id: integer("id").primaryKey(), // also the display order
-  category: text("category", { enum: CATEGORIES }).notNull(), // enum is type-only in SQLite (no CHECK)
+  category: text("category", { enum: CATEGORIES }).notNull(),
   prompt: text("prompt").notNull(),
   code: text("code"), // optional monospace snippet
-  options: text("options", { mode: "json" }).$type<string[]>().notNull(),
+  options: jsonb("options").$type<string[]>().notNull(),
   correctIndex: integer("correct_index").notNull(),
   points: integer("points").notNull(),
-});
+}).enableRLS();
 
-export const submissions = sqliteTable("submissions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const submissions = pgTable("submissions", {
+  id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
   studentId: integer("student_id")
     .notNull()
     .unique() // one submission per student
     .references(() => students.id),
-  answers: text("answers", { mode: "json" }).$type<Record<string, number>>().notNull(), // questionId -> option index
+  answers: jsonb("answers").$type<Record<string, number>>().notNull(), // questionId -> option ID
   score: integer("score").notNull(),
   timeTakenSec: integer("time_taken_sec").notNull(),
-  submittedAt: integer("submitted_at", { mode: "timestamp_ms" }).notNull(),
-});
+  submittedAt: timestamp("submitted_at", { withTimezone: true }).notNull(),
+}).enableRLS();
 
 // Key/value app state. "teamsLockedAt" present = teams are locked.
-export const settings = sqliteTable("settings", {
+export const settings = pgTable("settings", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
-});
+}).enableRLS();

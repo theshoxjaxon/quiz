@@ -1,20 +1,37 @@
-import { createClient } from "@libsql/client";
-import { drizzle } from "drizzle-orm/libsql";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
 
-// Turso when TURSO_DATABASE_URL is set (Vercel, or a one-off `npm run setup` for a deploy).
-// Otherwise a local SQLite file, so `npm run dev` and the tests work offline.
-export const dbUrl = process.env.TURSO_DATABASE_URL || "file:quiz.db";
-export const isRemote = !dbUrl.startsWith("file:");
+const MISSING_URL = `DATABASE_URL is not set.
+Create a free Supabase project for development, open Connect → "Transaction pooler", copy the
+connection string (port 6543), put your database password in it, and add it to .env.local:
+  DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
+On Vercel, add DATABASE_URL in Project → Settings → Environment Variables. See README.md.`;
 
-if (process.env.VERCEL && !isRemote) {
-  // Vercel's filesystem is read-only and not shared between requests, so a local file can't work there.
-  throw new Error("TURSO_DATABASE_URL is not set. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Vercel project settings.");
+export function databaseUrl() {
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error(MISSING_URL);
+  return url;
 }
 
-export const client = createClient({
-  url: dbUrl,
-  authToken: process.env.TURSO_AUTH_TOKEN || undefined,
-  timeout: 5000, // busy timeout for local files; Turso queues concurrent writes itself
-});
+let client: postgres.Sql | undefined;
+let instance: ReturnType<typeof drizzle> | undefined;
 
-export const db = drizzle(client);
+// Connects on first use, so `next build` and the offline tests never need DATABASE_URL.
+export function db() {
+  if (!instance) {
+    client = postgres(databaseUrl(), {
+      prepare: false, // Supabase's transaction pooler (port 6543) doesn't support prepared statements
+      max: 1, // one connection per serverless instance; the pooler does the rest
+      idle_timeout: 20, // seconds: let idle instances drop their connection
+      onnotice: () => {}, // silence "already exists, skipping" notices from migrations
+    });
+    instance = drizzle(client);
+  }
+  return instance;
+}
+
+export type Tx = Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0];
+
+export async function closeDb() {
+  await client?.end();
+}

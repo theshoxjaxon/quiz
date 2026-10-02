@@ -1,26 +1,29 @@
 // API-level tests against a real production server (`next start`) on a throwaway database and port.
+// The database is PGlite (Postgres in this process, in memory), served over a local socket so the app
+// uses its real driver. No database server, no network, and never your DATABASE_URL.
 // Needs a current build: `npm run build && npm test`.
 import assert from "node:assert/strict";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { createClient, type Client } from "@libsql/client";
+import { promisify } from "node:util";
+import { PGlite } from "@electric-sql/pglite";
+import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
 import { uz } from "../lib/i18n/uz.ts";
 import { QUIZ_MS, SUBMIT_GRACE_MS } from "../lib/quiz.ts";
 
 const ROOT = join(import.meta.dirname, "..");
-const dir = mkdtempSync(join(tmpdir(), "quiz-api-"));
 const PORT = 4100 + Math.floor(Math.random() * 800);
 const BASE = `http://localhost:${PORT}`;
-const DB_URL = `file:${join(dir, "test.db")}`;
-// Explicit values win over .env.local for both Node and Next, so the tests can never reach a real Turso database.
-const env = { ...process.env, TURSO_DATABASE_URL: DB_URL, TURSO_AUTH_TOKEN: "", ADMIN_PASSWORD: "test-pw" };
+// Filled in before(): DATABASE_URL points at the PGlite socket. Explicit values win over .env.local for
+// both Node and Next, so the tests can never reach your real (Supabase) database.
+let env: NodeJS.ProcessEnv;
 const ADMIN = { authorization: "Basic " + Buffer.from("teacher:test-pw").toString("base64") };
 const JSON_HEADERS = { "content-type": "application/json" };
 let server: ChildProcess | undefined;
-let db: Client;
+let pg: PGlite;
+let pgServer: PGLiteSocketServer | undefined;
 
 const newestSource = (path: string): number =>
   statSync(path).isDirectory()
@@ -32,7 +35,12 @@ before(async () => {
   if (Math.max(...["app", "lib", "db", "proxy.ts"].map((p) => newestSource(join(ROOT, p)))) > built) {
     throw new Error("The production build is missing or older than the source. Run `npm run build` first.");
   }
-  execFileSync(process.execPath, ["db/setup.ts"], { cwd: ROOT, env, stdio: "ignore" }); // migrations + questions
+  pg = await PGlite.create();
+  pgServer = new PGLiteSocketServer({ db: pg, port: 0, host: "127.0.0.1" });
+  await pgServer.start();
+  env = { ...process.env, DATABASE_URL: `postgres://postgres:postgres@${pgServer.getServerConn()}/postgres`, ADMIN_PASSWORD: "test-pw" };
+  // Async on purpose: the socket server lives in this process, so a blocking call would deadlock.
+  await promisify(execFile)(process.execPath, ["db/setup.ts"], { cwd: ROOT, env }); // migrations + questions
   server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(PORT)], {
     cwd: ROOT,
     env,
@@ -42,19 +50,18 @@ before(async () => {
   for (let i = 0; i < 150 && !(await fetch(`${BASE}/api/quiz`).then(() => true, () => false)); i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
-  db = createClient({ url: DB_URL, timeout: 5000 });
 });
 
-after(() => {
+after(async () => {
   if (server?.pid) process.kill(-server.pid);
-  db?.close();
-  rmSync(dir, { recursive: true, force: true });
+  await pgServer?.stop();
+  await pg?.close();
 });
 
-const rows = async <T>(sql: string) => (await db.execute(sql)).rows as unknown as T[];
+const rows = async <T>(sql: string) => (await pg.query<T>(sql)).rows;
 const count = async (sql: string) => Number((await rows<{ n: number }>(sql))[0].n);
 const backdate = (studentId: string, ms: number) =>
-  db.execute({ sql: "update students set started_at = ? where student_id = ?", args: [Date.now() - ms, studentId] });
+  pg.query("update students set started_at = $1 where student_id = $2", [new Date(Date.now() - ms), studentId]);
 const admin = (method: string, path: string) => fetch(BASE + path, { method, headers: ADMIN });
 const submit = (cookie: string, body: object) =>
   fetch(`${BASE}/api/submit`, { method: "POST", headers: { ...JSON_HEADERS, cookie }, body: JSON.stringify(body) });
@@ -84,7 +91,7 @@ test("registration: one per name and per ID, resume needs both, rejected after s
   const otherName = await register("Someone Else", "ada1");
   assert.equal(otherName.status, 409);
   assert.equal(otherName.error, uz.errors.idTakenOtherName);
-  assert.equal(await count("select count(*) n from students where name_key = 'ada lovelace' or student_id like 'ada%'"), 1);
+  assert.equal(await count("select count(*)::int n from students where name_key = 'ada lovelace' or student_id like 'ada%'"), 1);
 
   assert.equal((await submit(first.cookie, { answers: {} })).status, 200);
   const sameAgain = await register("Ada Lovelace", "ada1");
@@ -96,8 +103,8 @@ test("registration: one per name and per ID, resume needs both, rejected after s
 
   // The database itself refuses a second row with the same normalized name.
   await assert.rejects(
-    db.execute("insert into students (name, name_key, student_id, token, started_at) values ('x', 'ada lovelace', 'x9', 'tok-x9', 0)"),
-    /UNIQUE/,
+    pg.query("insert into students (name, name_key, student_id, token, started_at) values ('x', 'ada lovelace', 'x9', 'tok-x9', now())"),
+    /duplicate key value violates unique constraint "students_name_key_unique"/,
   );
 });
 
@@ -116,7 +123,7 @@ test("late cap: accepted up to 2 minutes past the deadline, rejected after", asy
   const res = await submit(tooLate.cookie, { answers: {}, startedAt: Date.now(), submittedAt: Date.now() });
   assert.equal(res.status, 403);
   assert.equal(
-    await count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id = 'late2'"),
+    await count("select count(*)::int n from submissions s join students st on st.id = s.student_id where st.student_id = 'late2'"),
     0,
   );
 });
@@ -139,7 +146,7 @@ test("team lock: the API refuses to regenerate while locked", async () => {
 
 test("options: shuffled per student, stable on refresh, graded by option ID", async () => {
   type Quiz = { questions: { id: number; options: { id: number; text: string }[] }[] };
-  const key = await rows<{ id: number; options: string; correct_index: number; points: number }>(
+  const key = await rows<{ id: number; options: string[]; correct_index: number; points: number }>(
     "select id, options, correct_index, points from questions",
   );
   const { cookie } = await register("Shuffle Sam", "shuffle1");
@@ -150,7 +157,7 @@ test("options: shuffled per student, stable on refresh, graded by option ID", as
   const quiz: Quiz = JSON.parse(raw);
   assert.deepEqual((JSON.parse(await load()) as Quiz).questions, quiz.questions, "same order after a refresh");
   for (const q of quiz.questions) {
-    const seedOptions: string[] = JSON.parse(key.find((k) => k.id === q.id)!.options);
+    const seedOptions = key.find((k) => k.id === q.id)!.options; // jsonb arrives parsed
     q.options.forEach((o) => assert.equal(o.text, seedOptions[o.id], "option ID maps to its text"));
     assert.equal(new Set(q.options.map((o) => o.id)).size, seedOptions.length);
   }
@@ -175,14 +182,13 @@ test("options: shuffled per student, stable on refresh, graded by option ID", as
   );
 });
 
-test("30 submissions in the same instant all succeed (WAL + busy timeout)", async () => {
-  assert.equal((await rows<{ journal_mode: string }>("PRAGMA journal_mode"))[0].journal_mode, "wal");
+test("30 submissions in the same instant all succeed (one pooled connection per server)", async () => {
   const cookies: string[] = [];
   for (let i = 0; i < 30; i++) cookies.push((await register(`Burst Student ${i}`, `burst${i}`)).cookie);
   const statuses = await Promise.all(cookies.map((c) => submit(c, { answers: { 1: 2 } }).then((r) => r.status)));
   assert.deepEqual(statuses, Array(30).fill(200));
   assert.equal(
-    await count("select count(*) n from submissions s join students st on st.id = s.student_id where st.student_id like 'burst%'"),
+    await count("select count(*)::int n from submissions s join students st on st.id = s.student_id where st.student_id like 'burst%'"),
     30,
   );
 });

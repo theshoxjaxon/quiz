@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { students, submissions } from "@/db/schema";
@@ -8,8 +8,9 @@ import { cleanName, nameKey } from "@/lib/quiz";
 import { COOKIE } from "@/lib/server";
 
 const reject = (error: string) => NextResponse.json({ error }, { status: 409 });
+const findStudent = async (where: SQL) => (await db().select().from(students).where(where).limit(1))[0];
 const hasSubmitted = async (id: number) =>
-  !!(await db.select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, id)).get());
+  (await db().select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, id)).limit(1)).length > 0;
 
 // One registration per student ID and per name (both unique in the DB).
 // Same name + same ID resumes the unsubmitted session; any mismatch is rejected so two students
@@ -23,23 +24,18 @@ export async function POST(req: Request) {
   }
   const key = nameKey(name);
 
-  // ON CONFLICT DO NOTHING covers both unique columns, so concurrent duplicates can't slip in,
-  // even across several server instances: the database decides, not this process.
-  await db
+  // ON CONFLICT DO NOTHING (no target) covers every unique constraint, so concurrent duplicates can't
+  // slip in, even across several server instances: the database decides, not this process.
+  await db()
     .insert(students)
     .values({ name, nameKey: key, studentId, token: randomUUID(), startedAt: new Date() })
-    .onConflictDoNothing()
-    .run();
+    .onConflictDoNothing();
 
-  const student = await db.select().from(students).where(eq(students.studentId, studentId)).get();
+  const student = await findStudent(eq(students.studentId, studentId));
   if (!student) {
     // Insert was skipped because the name is taken under another ID.
-    const sameName = (await db.select().from(students).where(eq(students.nameKey, key)).get())!;
-    return reject(
-      (await hasSubmitted(sameName.id))
-        ? uz.errors.nameTakenSubmitted
-        : uz.errors.nameTakenOtherId,
-    );
+    const sameName = (await findStudent(eq(students.nameKey, key)))!;
+    return reject((await hasSubmitted(sameName.id)) ? uz.errors.nameTakenSubmitted : uz.errors.nameTakenOtherId);
   }
   if (student.nameKey !== key) {
     return reject(uz.errors.idTakenOtherName);

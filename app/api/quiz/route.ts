@@ -12,11 +12,12 @@ export async function GET() {
   const student = await currentStudent();
   if (!student) return NextResponse.json({ error: uz.errors.notRegistered }, { status: 401 });
 
-  if (await db.select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, student.id)).get()) {
+  const submitted = await db().select({ id: submissions.id }).from(submissions).where(eq(submissions.studentId, student.id)).limit(1);
+  if (submitted.length > 0) {
     return NextResponse.json({ submitted: true });
   }
 
-  const qs = await db
+  const qs = await db()
     .select({
       id: questions.id,
       category: questions.category,
